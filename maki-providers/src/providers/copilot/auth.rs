@@ -1,9 +1,13 @@
 use std::env;
 use std::fs;
 use std::path::PathBuf;
+use std::process::Command;
+use std::sync::LazyLock;
 use std::thread;
 use std::time::{Duration, Instant};
 
+use base64::Engine;
+use base64::engine::general_purpose::STANDARD;
 use isahc::ReadResponseExt;
 use isahc::config::Configurable;
 use maki_storage::StateDir;
@@ -19,14 +23,31 @@ use crate::providers::urlenc;
 const TOKEN_ENV_VARS: &[&str] = &["GH_COPILOT_TOKEN", "COPILOT_GITHUB_TOKEN"];
 const COPILOT_DOMAIN: &str = "github.com";
 const PROVIDER: &str = "copilot";
-const CLIENT_ID: &str = "Iv1.b507a08c87ecfe98";
+// Fallback used by `maki auth login copilot` when no existing GitHub/Copilot
+// OAuth token can be exchanged. This is not a Pi/Maki app id; the decoded value
+// is a public GitHub OAuth client id used by Copilot-compatible device-code
+// flows.
+const CLIENT_ID_B64: &str = "SXYxLmI1MDdhMDhjODdlY2ZlOTg=";
+static CLIENT_ID: LazyLock<String> = LazyLock::new(|| {
+    String::from_utf8(
+        STANDARD
+            .decode(CLIENT_ID_B64)
+            .expect("valid Copilot OAuth client id"),
+    )
+    .expect("UTF-8 Copilot OAuth client id")
+});
 const DEVICE_CODE_URL: &str = "https://github.com/login/device/code";
 const ACCESS_TOKEN_URL: &str = "https://github.com/login/oauth/access_token";
 const COPILOT_TOKEN_URL: &str = "https://api.github.com/copilot_internal/v2/token";
+const COPILOT_USER_AGENT: &str = "GitHubCopilotChat/0.35.0";
+const COPILOT_EDITOR_VERSION: &str = "vscode/1.107.0";
+const COPILOT_PLUGIN_VERSION: &str = "copilot-chat/0.35.0";
+const COPILOT_INTEGRATION_ID: &str = "vscode-chat";
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 const POLL_TIMEOUT: Duration = Duration::from_secs(900);
 const DEFAULT_POLL_INTERVAL: u64 = 5;
+const TOKEN_EXPIRY_MARGIN_MILLIS: u64 = 5 * 60 * 1000;
 
 #[derive(Deserialize)]
 struct DeviceCodeResponse {
@@ -60,20 +81,45 @@ pub(crate) fn load_token() -> Result<String, AgentError> {
         }
     }
 
-    if let Ok(dir) = StateDir::resolve() {
-        if let Some(token) = load_saved_token(&dir)? {
+    let dir = StateDir::resolve().ok();
+    if let Some(dir) = &dir {
+        if let Some(token) = load_saved_token(dir)? {
             return Ok(token);
         }
-        if let Some(creds) = maki_storage::auth::load_provider_credentials(&dir, PROVIDER) {
+        if let Some(creds) = maki_storage::auth::load_provider_credentials(dir, PROVIDER) {
             return Ok(creds.api_key);
         }
     }
 
+    if let Some(token) = external_github_oauth_token() {
+        if endpoint_from_token(&token).is_some() {
+            return Ok(token);
+        }
+        match refresh_copilot_token(&token) {
+            Ok(tokens) => {
+                let access = tokens.access.clone();
+                if let Some(dir) = &dir {
+                    save_tokens(dir, PROVIDER, &tokens)?;
+                }
+                return Ok(access);
+            }
+            Err(err) => {
+                warn!(error = %err, "external GitHub token could not be exchanged for Copilot token")
+            }
+        }
+    }
+
+    Err(AgentError::Config {
+        message: "Copilot token not found. Run `maki auth login copilot`, sign in with GitHub Copilot, or set GH_COPILOT_TOKEN.".into(),
+    })
+}
+
+fn external_github_oauth_token() -> Option<String> {
     for path in copilot_config_paths() {
         if let Ok(contents) = fs::read_to_string(path)
             && let Some(token) = extract_json_oauth_token(&contents, COPILOT_DOMAIN)
         {
-            return Ok(token);
+            return Some(token);
         }
     }
 
@@ -81,13 +127,25 @@ pub(crate) fn load_token() -> Result<String, AgentError> {
         if let Ok(contents) = fs::read_to_string(path)
             && let Some(token) = extract_yaml_oauth_token(&contents, COPILOT_DOMAIN)
         {
-            return Ok(token);
+            return Some(token);
         }
     }
 
-    Err(AgentError::Config {
-        message: "Copilot token not found. Run `maki auth login copilot`, `gh auth login --web`, or set GH_COPILOT_TOKEN.".into(),
-    })
+    gh_cli_oauth_token()
+}
+
+fn gh_cli_oauth_token() -> Option<String> {
+    let output = Command::new("gh")
+        .args(["auth", "token", "--hostname", COPILOT_DOMAIN])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    String::from_utf8(output.stdout)
+        .ok()
+        .map(|token| token.trim().to_owned())
+        .filter(|token| !token.is_empty())
 }
 
 fn load_saved_token(dir: &StateDir) -> Result<Option<String>, AgentError> {
@@ -130,12 +188,13 @@ fn http_client(timeout: Duration) -> Result<isahc::HttpClient, AgentError> {
 
 fn request_device_code() -> Result<DeviceCodeResponse, AgentError> {
     let client = http_client(REQUEST_TIMEOUT)?;
-    let body = format!("client_id={}&scope=read:user", urlenc(CLIENT_ID));
+    let body = format!("client_id={}&scope=read:user", urlenc(CLIENT_ID.as_str()));
     let request = isahc::Request::builder()
         .method("POST")
         .uri(DEVICE_CODE_URL)
         .header("accept", "application/json")
         .header("content-type", "application/x-www-form-urlencoded")
+        .header("user-agent", COPILOT_USER_AGENT)
         .body(body.into_bytes())?;
     let mut response = client.send(request).map_err(|e| AgentError::Config {
         message: format!("device code request: {e}"),
@@ -152,11 +211,11 @@ fn request_device_code() -> Result<DeviceCodeResponse, AgentError> {
 
 fn poll_access_token(device: &DeviceCodeResponse) -> Result<String, AgentError> {
     let client = http_client(REQUEST_TIMEOUT)?;
-    let interval = Duration::from_secs(device.interval.unwrap_or(DEFAULT_POLL_INTERVAL).max(1));
+    let mut interval = Duration::from_secs(device.interval.unwrap_or(DEFAULT_POLL_INTERVAL).max(1));
     let deadline = Instant::now() + Duration::from_secs(device.expires_in).min(POLL_TIMEOUT);
     let body = format!(
         "client_id={}&device_code={}&grant_type=urn:ietf:params:oauth:grant-type:device_code",
-        urlenc(CLIENT_ID),
+        urlenc(CLIENT_ID.as_str()),
         urlenc(&device.device_code),
     );
     loop {
@@ -171,6 +230,7 @@ fn poll_access_token(device: &DeviceCodeResponse) -> Result<String, AgentError> 
             .uri(ACCESS_TOKEN_URL)
             .header("accept", "application/json")
             .header("content-type", "application/x-www-form-urlencoded")
+            .header("user-agent", COPILOT_USER_AGENT)
             .body(body.clone().into_bytes())?;
         let mut response = client.send(request).map_err(|e| AgentError::Config {
             message: format!("device token poll: {e}"),
@@ -182,7 +242,7 @@ fn poll_access_token(device: &DeviceCodeResponse) -> Result<String, AgentError> 
         }
         match token.error.as_deref() {
             Some("authorization_pending") => {}
-            Some("slow_down") => thread::sleep(interval),
+            Some("slow_down") => interval += Duration::from_secs(5),
             Some(error) => {
                 let suffix = token
                     .error_description
@@ -208,10 +268,10 @@ fn refresh_copilot_token(github_token: &str) -> Result<OAuthTokens, AgentError> 
         .uri(COPILOT_TOKEN_URL)
         .header("accept", "application/json")
         .header("authorization", format!("Bearer {github_token}"))
-        .header("user-agent", "GitHubCopilotChat/0.35.0")
-        .header("editor-version", "vscode/1.107.0")
-        .header("editor-plugin-version", "copilot-chat/0.35.0")
-        .header("copilot-integration-id", "vscode-chat")
+        .header("user-agent", COPILOT_USER_AGENT)
+        .header("editor-version", COPILOT_EDITOR_VERSION)
+        .header("editor-plugin-version", COPILOT_PLUGIN_VERSION)
+        .header("copilot-integration-id", COPILOT_INTEGRATION_ID)
         .body(())?;
     let mut response = client.send(request).map_err(|e| AgentError::Config {
         message: format!("Copilot token refresh: {e}"),
@@ -227,12 +287,39 @@ fn refresh_copilot_token(github_token: &str) -> Result<OAuthTokens, AgentError> 
     Ok(OAuthTokens {
         access: token.token,
         refresh: github_token.into(),
-        expires: token.expires_at * 1000,
+        expires: token
+            .expires_at
+            .saturating_mul(1000)
+            .saturating_sub(TOKEN_EXPIRY_MARGIN_MILLIS),
         account_id: None,
     })
 }
 
 pub fn login(dir: &StateDir) -> Result<(), AgentError> {
+    if let Some(github_token) = external_github_oauth_token() {
+        if endpoint_from_token(&github_token).is_some() {
+            maki_storage::auth::save_provider_credentials(
+                dir,
+                PROVIDER,
+                &maki_storage::auth::ProviderCredentials {
+                    api_key: github_token,
+                },
+            )?;
+            println!("Authenticated with existing Copilot token.");
+            return Ok(());
+        }
+        match refresh_copilot_token(&github_token) {
+            Ok(tokens) => {
+                save_tokens(dir, PROVIDER, &tokens)?;
+                println!("Authenticated with existing GitHub token.");
+                return Ok(());
+            }
+            Err(err) => {
+                warn!(error = %err, "external GitHub token could not be exchanged for Copilot token; falling back to device login")
+            }
+        }
+    }
+
     let device = request_device_code()?;
     println!(
         "Open this URL in your browser:\n\n  {}\n",
