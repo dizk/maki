@@ -11,7 +11,7 @@ use tracing::{debug, warn};
 
 use super::openai::responses;
 use super::openai_compat;
-use crate::model::{Model, ModelEntry, ModelFamily, ModelPricing, ModelTier};
+use crate::model::{Model, ModelEntry, ModelFamily, ModelInfo, ModelPricing, ModelTier};
 use crate::provider::{BoxFuture, Provider};
 use crate::{AgentError, Message, ProviderEvent, RequestOptions, StreamResponse, ThinkingConfig};
 
@@ -31,8 +31,11 @@ inventory::submit!(maki_config::providers::BuiltInProvider {
     needs_url: false,
 });
 const GRAPHQL_QUERY: &str = "query { viewer { copilotEndpoints { api } } }";
-const API_VERSION_HEADER: &str = "2025-10-01";
-const EDITOR_VERSION_HEADER: &str = concat!("Maki/", env!("CARGO_PKG_VERSION"));
+const API_VERSION_HEADER: &str = "2026-06-01";
+const USER_AGENT_HEADER: &str = "GitHubCopilotChat/0.35.0";
+const EDITOR_VERSION_HEADER: &str = "vscode/1.107.0";
+const EDITOR_PLUGIN_VERSION_HEADER: &str = "copilot-chat/0.35.0";
+const COPILOT_INTEGRATION_ID_HEADER: &str = "vscode-chat";
 const CHAT_COMPLETIONS_PATH: &str = "/chat/completions";
 const RESPONSES_PATH: &str = "/responses";
 const MESSAGES_PATH: &str = "/v1/messages";
@@ -50,24 +53,37 @@ pub(crate) fn models() -> &'static [ModelEntry] {
             context_window: 200_000,
         },
         ModelEntry {
-            prefixes: &["gpt-5.2", "gpt-4.1", "claude-sonnet-4.5"],
+            prefixes: &["gpt-5.2", "gpt-5.3-codex"],
             tier: ModelTier::Medium,
             family: ModelFamily::Generic,
             default: true,
+            pricing: ModelPricing::ZERO,
+            max_output_tokens: 128_000,
+            context_window: 400_000,
+        },
+        ModelEntry {
+            prefixes: &["gpt-4.1", "claude-sonnet-4.5", "grok-code-fast-1"],
+            tier: ModelTier::Medium,
+            family: ModelFamily::Generic,
+            default: false,
             pricing: ModelPricing::ZERO,
             max_output_tokens: 100_000,
             context_window: 200_000,
         },
         ModelEntry {
-            prefixes: &[
-                "gpt-5.4",
-                "gpt-5.3-codex",
-                "claude-opus-4.6",
-                "grok-code-fast-1",
-            ],
+            prefixes: &["gpt-5.4", "gpt-5.5"],
             tier: ModelTier::Strong,
             family: ModelFamily::Generic,
             default: true,
+            pricing: ModelPricing::ZERO,
+            max_output_tokens: 128_000,
+            context_window: 400_000,
+        },
+        ModelEntry {
+            prefixes: &["claude-opus-4.6", "claude-opus-4.7", "claude-opus-4.8"],
+            tier: ModelTier::Strong,
+            family: ModelFamily::Generic,
+            default: false,
             pricing: ModelPricing::ZERO,
             max_output_tokens: 100_000,
             context_window: 200_000,
@@ -126,7 +142,10 @@ impl Copilot {
         }
 
         let token = auth::load_token()?;
-        let endpoint = discover_api_endpoint(&self.client, &token).await;
+        let endpoint = match auth::endpoint_from_token(&token) {
+            Some(endpoint) => endpoint,
+            None => discover_api_endpoint(&self.client, &token).await,
+        };
         let auth = CopilotAuth { token, endpoint };
         *self.auth.lock().unwrap() = Some(auth.clone());
         Ok(auth)
@@ -343,7 +362,8 @@ impl CopilotModel {
             && self
                 .policy
                 .as_ref()
-                .is_none_or(|policy| policy.state == "enabled")
+                .is_none_or(|policy| policy.state != "disabled")
+            && self.capabilities.supports.tool_calls != Some(false)
     }
 
     fn endpoint(&self) -> Endpoint {
@@ -363,6 +383,28 @@ impl CopilotModel {
             Endpoint::ChatCompletions
         }
     }
+
+    fn info(&self) -> ModelInfo {
+        ModelInfo {
+            id: self.id.clone(),
+            context_window: self.context_window(),
+            max_output_tokens: self.max_output_tokens(),
+            pricing: None,
+        }
+    }
+
+    fn context_window(&self) -> Option<u32> {
+        self.capabilities
+            .limits
+            .max_prompt_tokens
+            .zip(self.capabilities.limits.max_output_tokens)
+            .map(|(input, output)| input.saturating_add(output))
+            .or(self.capabilities.limits.max_context_window_tokens)
+    }
+
+    fn max_output_tokens(&self) -> Option<u32> {
+        self.capabilities.limits.max_output_tokens
+    }
 }
 
 #[derive(Clone, Default, Deserialize)]
@@ -375,6 +417,22 @@ struct CopilotModelPolicy {
 struct CopilotModelCapabilities {
     #[serde(default, rename = "type")]
     model_type: String,
+    #[serde(default)]
+    supports: CopilotModelSupports,
+    #[serde(default)]
+    limits: CopilotModelLimits,
+}
+
+#[derive(Clone, Default, Deserialize)]
+struct CopilotModelSupports {
+    tool_calls: Option<bool>,
+}
+
+#[derive(Clone, Default, Deserialize)]
+struct CopilotModelLimits {
+    max_context_window_tokens: Option<u32>,
+    max_prompt_tokens: Option<u32>,
+    max_output_tokens: Option<u32>,
 }
 
 #[derive(Deserialize)]
@@ -443,9 +501,13 @@ fn copilot_request(
     interaction_type: Option<&str>,
 ) -> isahc::http::request::Builder {
     let builder = builder
+        .header("accept", "application/json")
         .header("authorization", format!("Bearer {}", auth.token))
         .header("content-type", "application/json")
+        .header("user-agent", USER_AGENT_HEADER)
         .header("editor-version", EDITOR_VERSION_HEADER)
+        .header("editor-plugin-version", EDITOR_PLUGIN_VERSION_HEADER)
+        .header("copilot-integration-id", COPILOT_INTEGRATION_ID_HEADER)
         .header("x-github-api-version", API_VERSION_HEADER);
 
     if let Some(interaction_type) = interaction_type {
@@ -460,9 +522,19 @@ fn copilot_request(
 
 fn copilot_headers(auth: &CopilotAuth, interaction_type: Option<&str>) -> Vec<(String, String)> {
     let mut headers = vec![
+        ("accept".into(), "application/json".into()),
         ("authorization".into(), format!("Bearer {}", auth.token)),
         ("content-type".into(), "application/json".into()),
+        ("user-agent".into(), USER_AGENT_HEADER.into()),
         ("editor-version".into(), EDITOR_VERSION_HEADER.into()),
+        (
+            "editor-plugin-version".into(),
+            EDITOR_PLUGIN_VERSION_HEADER.into(),
+        ),
+        (
+            "copilot-integration-id".into(),
+            COPILOT_INTEGRATION_ID_HEADER.into(),
+        ),
         ("x-github-api-version".into(), API_VERSION_HEADER.into()),
     ];
     if let Some(interaction_type) = interaction_type {
@@ -555,10 +627,7 @@ impl Provider for Copilot {
     fn list_models(&self) -> BoxFuture<'_, Result<Vec<crate::model::ModelInfo>, AgentError>> {
         Box::pin(async move {
             let models = self.fetch_models().await?;
-            let infos = models
-                .iter()
-                .map(|model| crate::model::ModelInfo::id_only(model.id.clone()))
-                .collect::<Vec<_>>();
+            let infos = models.iter().map(CopilotModel::info).collect::<Vec<_>>();
             let mut guard = self.models.lock().unwrap();
             guard.clear();
             guard.extend(models.into_iter().map(|model| (model.id.clone(), model)));
@@ -584,9 +653,7 @@ mod tests {
         let mut model = CopilotModel {
             id: "claude-sonnet-4.5".into(),
             policy: None,
-            capabilities: CopilotModelCapabilities {
-                model_type: "chat".into(),
-            },
+            capabilities: CopilotModelCapabilities::default(),
             is_chat_default: false,
             model_picker_enabled: true,
             supported_endpoints: vec![CHAT_COMPLETIONS_PATH.into(), MESSAGES_PATH.into()],
@@ -609,6 +676,10 @@ mod tests {
             }),
             capabilities: CopilotModelCapabilities {
                 model_type: "chat".into(),
+                supports: CopilotModelSupports {
+                    tool_calls: Some(true),
+                },
+                limits: CopilotModelLimits::default(),
             },
             is_chat_default: false,
             model_picker_enabled: true,
@@ -618,10 +689,78 @@ mod tests {
 
         let disabled = CopilotModel {
             policy: Some(CopilotModelPolicy {
-                state: "pending".into(),
+                state: "disabled".into(),
             }),
-            ..enabled
+            ..enabled.clone()
         };
         assert!(!disabled.is_enabled_chat_model());
+
+        let no_tool_calls = CopilotModel {
+            capabilities: CopilotModelCapabilities {
+                model_type: "chat".into(),
+                supports: CopilotModelSupports {
+                    tool_calls: Some(false),
+                },
+                limits: CopilotModelLimits::default(),
+            },
+            ..enabled
+        };
+        assert!(!no_tool_calls.is_enabled_chat_model());
+    }
+
+    #[test]
+    fn info_uses_prompt_plus_output_for_context_window() {
+        let model = CopilotModel {
+            id: "gpt-5.5".into(),
+            policy: None,
+            capabilities: CopilotModelCapabilities {
+                model_type: "chat".into(),
+                supports: CopilotModelSupports::default(),
+                limits: CopilotModelLimits {
+                    max_context_window_tokens: Some(1_050_000),
+                    max_prompt_tokens: Some(272_000),
+                    max_output_tokens: Some(128_000),
+                },
+            },
+            is_chat_default: false,
+            model_picker_enabled: true,
+            supported_endpoints: vec![],
+        };
+
+        let info = model.info();
+        assert_eq!(info.context_window, Some(400_000));
+        assert_eq!(info.max_output_tokens, Some(128_000));
+    }
+
+    #[test]
+    fn static_gpt_5_5_metadata_matches_copilot_limit() {
+        let entry = models()
+            .iter()
+            .find(|entry| entry.prefixes.contains(&"gpt-5.5"))
+            .expect("gpt-5.5 static entry");
+        assert_eq!(entry.context_window, 400_000);
+        assert_eq!(entry.max_output_tokens, 128_000);
+    }
+
+    #[test]
+    fn info_falls_back_to_context_window_when_prompt_limit_is_missing() {
+        let model = CopilotModel {
+            id: "gpt-5.4".into(),
+            policy: None,
+            capabilities: CopilotModelCapabilities {
+                model_type: "chat".into(),
+                supports: CopilotModelSupports::default(),
+                limits: CopilotModelLimits {
+                    max_context_window_tokens: Some(1_050_000),
+                    max_prompt_tokens: None,
+                    max_output_tokens: Some(128_000),
+                },
+            },
+            is_chat_default: false,
+            model_picker_enabled: true,
+            supported_endpoints: vec![],
+        };
+
+        assert_eq!(model.info().context_window, Some(1_050_000));
     }
 }

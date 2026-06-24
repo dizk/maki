@@ -559,6 +559,22 @@ mod tests {
         }
     }
 
+    #[test_case("copilot/claude-opus-4.7", ProviderKind::Copilot, "claude-opus-4.7", ModelTier::Strong ; "copilot_opus_4_7_strong")]
+    #[test_case("copilot/claude-opus-4.8", ProviderKind::Copilot, "claude-opus-4.8", ModelTier::Strong ; "copilot_opus_4_8_strong")]
+    #[test_case("copilot/gpt-5.3-codex", ProviderKind::Copilot, "gpt-5.3-codex", ModelTier::Medium ; "copilot_gpt_5_3_codex_medium")]
+    #[test_case("copilot/grok-code-fast-1", ProviderKind::Copilot, "grok-code-fast-1", ModelTier::Medium ; "copilot_grok_code_fast_medium")]
+    fn copilot_static_model_tiers(
+        spec: &str,
+        expected_provider: ProviderKind,
+        expected_id: &str,
+        expected_tier: ModelTier,
+    ) {
+        let model = Model::from_spec(spec).unwrap();
+        assert_eq!(model.provider, expected_provider);
+        assert_eq!(model.id, expected_id);
+        assert_eq!(model.tier, expected_tier);
+    }
+
     #[test_case("anthropic/claude-99-turbo", ProviderKind::Anthropic, "claude-99-turbo" ; "unknown_anthropic_model_accepted")]
     #[test_case("zai/glm-99", ProviderKind::Zai, "glm-99" ; "unknown_zai_model_accepted")]
     #[test_case("openai/gpt-99", ProviderKind::OpenAi, "gpt-99" ; "unknown_openai_model_accepted")]
