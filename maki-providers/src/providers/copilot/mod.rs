@@ -53,7 +53,7 @@ pub(crate) fn models() -> &'static [ModelEntry] {
             context_window: 200_000,
         },
         ModelEntry {
-            prefixes: &["gpt-5.2"],
+            prefixes: &["gpt-5.2", "gpt-5.3-codex"],
             tier: ModelTier::Medium,
             family: ModelFamily::Generic,
             default: true,
@@ -62,7 +62,7 @@ pub(crate) fn models() -> &'static [ModelEntry] {
             context_window: 400_000,
         },
         ModelEntry {
-            prefixes: &["gpt-4.1", "claude-sonnet-4.5"],
+            prefixes: &["gpt-4.1", "claude-sonnet-4.5", "grok-code-fast-1"],
             tier: ModelTier::Medium,
             family: ModelFamily::Generic,
             default: false,
@@ -71,7 +71,7 @@ pub(crate) fn models() -> &'static [ModelEntry] {
             context_window: 200_000,
         },
         ModelEntry {
-            prefixes: &["gpt-5.4", "gpt-5.3-codex", "gpt-5.5"],
+            prefixes: &["gpt-5.4", "gpt-5.5"],
             tier: ModelTier::Strong,
             family: ModelFamily::Generic,
             default: true,
@@ -80,7 +80,7 @@ pub(crate) fn models() -> &'static [ModelEntry] {
             context_window: 400_000,
         },
         ModelEntry {
-            prefixes: &["claude-opus-4.6", "grok-code-fast-1"],
+            prefixes: &["claude-opus-4.6", "claude-opus-4.7", "claude-opus-4.8"],
             tier: ModelTier::Strong,
             family: ModelFamily::Generic,
             default: false,
