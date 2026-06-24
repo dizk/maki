@@ -126,7 +126,10 @@ impl Copilot {
         }
 
         let token = auth::load_token()?;
-        let endpoint = discover_api_endpoint(&self.client, &token).await;
+        let endpoint = match auth::endpoint_from_token(&token) {
+            Some(endpoint) => endpoint,
+            None => discover_api_endpoint(&self.client, &token).await,
+        };
         let auth = CopilotAuth { token, endpoint };
         *self.auth.lock().unwrap() = Some(auth.clone());
         Ok(auth)
